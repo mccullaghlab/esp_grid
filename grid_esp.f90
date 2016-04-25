@@ -139,6 +139,7 @@ subroutine read_trajectory_compute_grid_esp()
         integer step
         real (kind=8) centerVec(3)
         real (kind=8) gridCenter(3)
+        real (kind=8) temp
         integer filenum
         integer totalSteps
 
@@ -184,20 +185,31 @@ subroutine read_trajectory_compute_grid_esp()
         atomEspMat = atomEspMat / dble(totalSteps)
         cgEspMat = cgEspMat / dble(totalSteps)
 
+        print*, "fitting grid charges"
         ! fit?
         call fit_cg_charges(atomEspMat,nAtoms,cgEspMat,nCgs,totalGrids,cgCharges)
 
+        print*, "fitting integral charges"
         ! fit using integral approach
         call integral_fit_charges(A, B, C, atomCharges, intCgCharges, nAtoms, nCgs, intRss)
 
         ! print CG charges
         open(35,file=outFile)
+        write(35,'(a10,a20,a20,a20)') "CG Site", "Grid Charges", "Integral Charges", "Squared difference"
+        write(*,'(a10,a20,a20,a20)') "CG Site", "Grid Charges", "Integral Charges", "Squared difference"
+        temp = 0
         do k=1, nCgs
-                write(35,'(i10,f20.10,f20.10)') k , cgCharges(k), intCgCharges(k)
-                write(*,'(i10,f20.10,f20.10)') k , cgCharges(k), intCgCharges(k)
-        enddo        
+                temp = temp + (cgCharges(k)-intCgCharges(k))**2
+                write(35,'(i10,f20.10,f20.10,f20.10)') k , cgCharges(k), intCgCharges(k), (cgCharges(k)-intCgCharges(k))**2
+                write(*,'(i10,f20.10,f20.10,f20.10)') k , cgCharges(k), intCgCharges(k), (cgCharges(k)-intCgCharges(k))**2
+        enddo    
+        write(35,'("Sums:", a20,a20,a20,a20)') "Atomic", "Grid Charges", "Integral Charges", "Sum of sq diff" 
+        write(35,'(4x,f20.10,f20.10,f20.10,f20.10)') sum(atomCharges), sum(cgCharges), sum(intCgCharges), temp
         close(35)
-        write(*,'("CG grid charge:", f10.5, "CG int charges:", f10.5, " total atom charge:", f10.5)') sum(cgCharges), sum(intCgCharges), sum(atomCharges)
+        write(*,'("Sums:", a20,a20,a20,a20)') "Atomic", "Grid Charges", "Integral Charges", "Sum of sq diff"
+        write(*,'(4x,f20.10,f20.10,f20.10,f20.10)') sum(atomCharges), sum(cgCharges), sum(intCgCharges), temp
+        close(35)
+!        write(*,'("CG grid charge:", f10.5, "CG int charges:", f10.5, " total atom charge:", f10.5)') sum(cgCharges), sum(intCgCharges), sum(atomCharges)
 
 endsubroutine read_trajectory_compute_grid_esp
 
@@ -624,12 +636,10 @@ subroutine integral_fit_charges(A, B, C, atomCharges, cgCharges, nAtoms, nCg, rs
         real (kind=8) newB(nCg)
         real (kind=8) temp(1,1)
         real (kind=8) rss
-        !lapack routine variables
-        real (kind=8) workQuery(1)
-        real (kind=8), allocatable :: work(:)
-        integer info
-        integer lwork
         integer j, i, k
+        !lapack routine variables
+        integer ipiv(nCg)
+        integer info
 
         !First we need to modify A and B to have the correct matrix properties 
         !create D matrices
@@ -645,15 +655,10 @@ subroutine integral_fit_charges(A, B, C, atomCharges, cgCharges, nAtoms, nCg, rs
         ATemp(nCg,:) = 1.0
         BTemp(nCg,:) = 1.0
 
-        !Now use lapack routine to solve least squares problem A*cgCharges=B*atomCharges
+        ! multiple right hand side of equation by atomic charges
         newB = matmul(BTemp,atomCharges)
-        ! determine optimal size of work array
-        call dgels("N",nCg,nCg,1,ATemp,nCg,newB,nCg,workQuery,-1,info)
-        lwork = int(workQuery(1))
-        allocate(work(lwork))
-        ! perform fit
-        call dgels("N",nCg,nCg,1,ATemp,nCg,newB,nCg,work,lwork,info)
-        deallocate(work)
+        ! determine the solution to system of linear equations ATemp*X = newB
+        call dgesv(nCg,1, ATemp,nCg,ipiv,newB,nCg,info)
         
         cgCharges(:,1) = real(newB(1:nCg))
         atomChargesM(:,1) = atomCharges
