@@ -4,6 +4,8 @@ grid_esp.x
 
 A Program to compute the CG charges from all-atom and CG mapped trajectories.  This program uses a grid-based least squares approach.  The time average component has not been verified.  
 
+Added the integral based approach as well
+
 Usage:
 
 

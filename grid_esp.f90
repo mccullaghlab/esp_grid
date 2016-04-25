@@ -49,6 +49,16 @@ module gridData
 
 endmodule gridData
 
+module integralData
+
+        real (kind=8), allocatable :: A(:,:)
+        real (kind=8), allocatable :: B(:,:)
+        real (kind=8), allocatable :: C(:,:)
+        real (kind=8), allocatable :: intCgCharges(:)
+        real (kind=8) gridRss
+        real (kind=8) intRss
+
+endmodule integralData
 
 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 !!!!!!!!!  Main Program !!!!!!!!
@@ -65,17 +75,19 @@ program esp_grid
         real (kind=8) ti,tf
 
         ti = omp_get_wtime()
+        ! read config file, number of openMP threads and stride from command line
         call parse_command_line(cfgFile,nThreads,deltaStep)
         
+        ! read the rest of the config parameters from the config file
         call parse_config_file(cfgFile)
 
+        ! read the atom psf file to obtain number of atoms and charges.  atomPos and charge array are allocated in this routine
         call read_psf_file()
 
-        allocate(atomEspMat(totalGrids))
-        allocate(cgEspMat(totalGrids,nCgs))
-        atomEspMat = 0.0
-        cgEspMat = 0.0
+        ! allocate some grid and integral arrays
+        call allocate_arrays()
 
+        ! read the trajectories and perform the fits
         call read_trajectory_compute_grid_esp()
 
         tf = omp_get_wtime()
@@ -89,13 +101,38 @@ endprogram esp_grid
 !!!!!!! Subroutines  !!!!!!!!!
 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
+! allocate arrays
+subroutine allocate_arrays()
+        use atomData
+        use gridData
+        use cgData
+        use integralData
+        implicit none
+
+        ! grid based array containing the ESP multiplied by the atomic charges
+        allocate(atomEspMat(totalGrids))
+        ! grid based array containing 1/dist between grids and CG sites
+        allocate(cgEspMat(totalGrids,nCgs))
+        ! zero out each array as they will be added to
+        atomEspMat = 0.0
+        cgEspMat = 0.0
+
+        ! integral based matrices
+        allocate(A(nCgs,nCgs),B(nCgs,nAtoms),C(nAtoms,nAtoms),intCgCharges(nCgs))
+
+        A = 0.0
+        B = 0.0
+        C = 0.0
+
+endsubroutine allocate_arrays
+
 subroutine read_trajectory_compute_grid_esp()
         use inputData
         use atomData
         use cgData
         use gridData
+        use integralData
         implicit none
-        real (kind=8), parameter :: pi = 3.1415926535
         integer atom1
         integer k
         integer nSteps
@@ -129,11 +166,14 @@ subroutine read_trajectory_compute_grid_esp()
                                 print*, "sum of atom x component:", sum(atomPos(:,1))     
                                 print*, "sum of cg x component:", sum(cgPos(:,1))     
                             
-                                ! compute the center of geometry positions of the BPs
+                                ! compute ESP matrices.  Atomic one is distance to grid points times atomic charge.  
+                                ! CG is only distance to grid points.
                                 call compute_atom_grid_esp(atomPos,nAtoms,atomCharges,atomEspMat)
                                 call compute_cg_grid_esp(cgPos,nCgs,cgEspMat)
-                                ! fit?
+                                ! fit - do we need to fit every time and average the CG charges at the end
 
+                                ! update A, B and C matrices for integral method
+                                call update_A_B_C_matrices(atomPos,nAtoms,cgPos,nCgs,A,B,C)
                         endif
                 enddo
                 close(20)
@@ -147,14 +187,17 @@ subroutine read_trajectory_compute_grid_esp()
         ! fit?
         call fit_cg_charges(atomEspMat,nAtoms,cgEspMat,nCgs,totalGrids,cgCharges)
 
+        ! fit using integral approach
+        call integral_fit_charges(A, B, C, atomCharges, intCgCharges, nAtoms, nCgs, intRss)
+
         ! print CG charges
         open(35,file=outFile)
         do k=1, nCgs
-                write(35,'(i10,f20.10)') k , cgCharges(k)
-                write(*,'(i10,f20.10)') k , cgCharges(k)
+                write(35,'(i10,f20.10,f20.10)') k , cgCharges(k), intCgCharges(k)
+                write(*,'(i10,f20.10,f20.10)') k , cgCharges(k), intCgCharges(k)
         enddo        
         close(35)
-        write(*,'("total CG charge:", f10.5, " total atom charge:", f10.5)') sum(cgCharges), sum(atomCharges)
+        write(*,'("CG grid charge:", f10.5, "CG int charges:", f10.5, " total atom charge:", f10.5)') sum(cgCharges), sum(intCgCharges), sum(atomCharges)
 
 endsubroutine read_trajectory_compute_grid_esp
 
@@ -562,5 +605,123 @@ subroutine parse_config_file(cfgFile)
         gridCut = int(cutoff/deltaGrid) + 1
 
 endsubroutine parse_config_file
+
+
+!subroutine to compute CG charges from input matrices A and B.  The residual sum of squares is calculated with aid of all-atom matrix C
+subroutine integral_fit_charges(A, B, C, atomCharges, cgCharges, nAtoms, nCg, rss)
+        implicit none
+        integer nAtoms
+        integer nCg
+        real (kind=8) A(nCg,nCg)
+        real (kind=8) ATemp(nCg,nCg)
+        real (kind=8) D(nCg-1,nCg)
+        real (kind=8) B(nCg,nAtoms)
+        real (kind=8) C(nAtoms,nAtoms)
+        real (kind=8) BTemp(nCg,nAtoms)
+        real (kind=8) cgCharges(nCg,1)
+        real (kind=8) atomCharges(nAtoms)
+        real (kind=8) atomChargesM(nAtoms,1)
+        real (kind=8) newB(nCg)
+        real (kind=8) temp(1,1)
+        real (kind=8) rss
+        !lapack routine variables
+        real (kind=8) workQuery(1)
+        real (kind=8), allocatable :: work(:)
+        integer info
+        integer lwork
+        integer j, i, k
+
+        !First we need to modify A and B to have the correct matrix properties 
+        !create D matrices
+        D=0.0
+        do i=1,nCg-1
+                D(i,i)=1.0
+                D(i,i+1)=-1.0
+        enddo 
+        !multiply A by D0 and B by D1 giving new matrices A and B the correct behavior
+        ATemp(1:(nCg-1),:) = matmul(D,A)
+        BTemp(1:(nCg-1),:) = matmul(D,B)
+        !generate new matrices with last line having 1.0s forcing charge conservation
+        ATemp(nCg,:) = 1.0
+        BTemp(nCg,:) = 1.0
+
+        !Now use lapack routine to solve least squares problem A*cgCharges=B*atomCharges
+        newB = matmul(BTemp,atomCharges)
+        ! determine optimal size of work array
+        call dgels("N",nCg,nCg,1,ATemp,nCg,newB,nCg,workQuery,-1,info)
+        lwork = int(workQuery(1))
+        allocate(work(lwork))
+        ! perform fit
+        call dgels("N",nCg,nCg,1,ATemp,nCg,newB,nCg,work,lwork,info)
+        deallocate(work)
+        
+        cgCharges(:,1) = real(newB(1:nCg))
+        atomChargesM(:,1) = atomCharges
+
+        ! compute residual sum of squares
+        temp = matmul(transpose(atomChargesM),matmul(C,atomChargesM))+matmul(transpose(cgCharges),matmul(A,cgCharges))-2*matmul(transpose(cgCharges),matmul(B,atomChargesM))
+        rss = temp(1,1)
+
+endsubroutine integral_fit_charges
+
+!requires lapack
+subroutine update_A_B_C_matrices(atomPos,nAtoms,cgPos,nCgs,A,B,C)
+        implicit none
+        integer nAtoms
+        integer nCgs
+        real (kind=8) atomPos(nAtoms,3)
+        real (kind=8) atomCharges(nAtoms)
+        real (kind=8) cgPos(nCgs,3)
+        real (kind=8) A(nCgs,nCgs)
+        real (kind=8) B(nCgs,nAtoms)
+        real (kind=8) C(nAtoms,nAtoms)
+        real (kind=8) dist, temp
+        !loop indeces
+        integer cgSite1, cgSite2
+        integer j
+        integer atom1, atom2
+
+        ! populate A matrix with negative distances between CG sites
+        do cgSite1 = 1, nCgs-1
+                do cgSite2 = cgSite1+1,nCgs
+                        dist = 0
+                        do j=1,3
+                                temp = cgPos(cgSite1,j)-cgPos(cgSite2,j)
+                                dist = dist + temp*temp
+                        enddo
+                        dist = sqrt(dist)
+                        A(cgSite1,cgSite2) = A(cgSite1,cgSite2)-dist
+                        !symmetrize the matrix
+                        A(cgSite2,cgSite1) = A(cgSite1,cgSite2)
+                enddo
+        enddo
+
+        ! populate B matrix with negative distance between CG sites and atoms
+        do cgSite1 = 1, nCgs
+                do atom1 = 1,nAtoms
+                        dist = 0
+                        do j=1,3
+                                temp = cgPos(cgSite1,j)-atomPos(atom1,j)
+                                dist = dist + temp*temp
+                        enddo
+                        B(cgSite1,atom1) = B(cgSite1,atom1)-sqrt(dist)
+                enddo
+        enddo
+
+        ! populate C matrix with negative distance between atoms
+        do atom1 = 1, nAtoms-1
+                do atom2 = atom1+1, nAtoms
+                        dist = 0
+                        do j=1,3
+                                temp = atomPos(atom1,j)-atomPos(atom2,j)
+                                dist = dist + temp*temp
+                        enddo
+                        C(atom1,atom2) = C(atom1,atom2)-sqrt(dist)
+                        ! symmetrize the matrix
+                        C(atom2,atom1) = C(atom1,atom2)
+                enddo
+        enddo
+
+endsubroutine update_A_B_C_matrices
 
 
